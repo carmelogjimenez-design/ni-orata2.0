@@ -1,9 +1,9 @@
 export const config = { runtime: 'edge' };
 
-const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
-const MODEL_VERSION = 'a029dff38972b5fda4ec5d75d7d1cd25aeff621d2cf4946a41055d7db66b80bc';
+const HF_TOKEN = process.env.HUGGINGFACE_API_TOKEN;
+const MODEL = 'briaai/RMBG-1.4';
 
-const CORS_HEADERS = {
+const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
@@ -12,63 +12,68 @@ const CORS_HEADERS = {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+    headers: { ...CORS, 'Content-Type': 'application/json' },
   });
 }
 
+function base64ToBuffer(b64) {
+  const bin = atob(b64);
+  const len = bin.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
 export default async function handler(req) {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   if (req.method !== 'POST') return json({ error: 'Solo POST' }, 405);
-  if (!REPLICATE_TOKEN) return json({ error: 'REPLICATE_API_TOKEN no configurado' }, 500);
+  if (!HF_TOKEN) return json({ error: 'HUGGINGFACE_API_TOKEN no configurado en Vercel' }, 500);
 
   try {
     const body = await req.json();
-    const input = body.imageUrl || body.imageBase64;
-    if (!input) return json({ error: 'Falta imageUrl o imageBase64' }, 400);
+    const input = body.imageBase64;
+    if (!input) return json({ error: 'Falta imageBase64' }, 400);
 
-    const startRes = await fetch('https://api.replicate.com/v1/predictions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${REPLICATE_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        version: MODEL_VERSION,
-        input: { image: input },
-      }),
-    });
+    const base64 = input.includes(',') ? input.split(',')[1] : input;
+    const imageBytes = base64ToBuffer(base64);
 
-    let prediction = await startRes.json();
-
-    if (prediction.error) return json({ error: String(prediction.error) }, 500);
-    if (!prediction.id || !prediction.urls || !prediction.urls.get) {
-      return json({ error: 'Respuesta inesperada de Replicate: ' + JSON.stringify(prediction) }, 500);
-    }
-
-    const pollUrl = prediction.urls.get;
-    let attempts = 0;
-    while (
-      prediction.status !== 'succeeded' &&
-      prediction.status !== 'failed' &&
-      prediction.status !== 'canceled' &&
-      attempts < 60
-    ) {
-      await new Promise((r) => setTimeout(r, 1000));
-      const pollRes = await fetch(pollUrl, {
-        headers: { 'Authorization': `Bearer ${REPLICATE_TOKEN}` },
+    let lastError = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const hfRes = await fetch(`https://api-inference.huggingface.co/models/${MODEL}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${HF_TOKEN}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: imageBytes,
       });
-      prediction = await pollRes.json();
-      attempts++;
+
+      if (hfRes.ok) {
+        const resultBuffer = await hfRes.arrayBuffer();
+        const resultBase64 = bufferToBase64(resultBuffer);
+        const dataUrl = `data:image/png;base64,${resultBase64}`;
+        return json({ url: dataUrl });
+      }
+
+      const errText = await hfRes.text();
+      lastError = errText;
+
+      if (hfRes.status === 503) {
+        await new Promise((r) => setTimeout(r, 8000));
+        continue;
+      }
+
+      return json({ error: `HF error ${hfRes.status}: ${errText.slice(0, 200)}` }, 500);
     }
 
-    if (prediction.status !== 'succeeded') {
-      return json({ error: 'Falló: ' + (prediction.error || prediction.status) }, 500);
-    }
-
-    const url = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
-    if (!url) return json({ error: 'No se obtuvo URL de salida' }, 500);
-
-    return json({ url });
+    return json({ error: 'Modelo cargando, reintenta en 30s: ' + lastError.slice(0, 150) }, 503);
   } catch (err) {
     return json({ error: err.message || String(err) }, 500);
   }
