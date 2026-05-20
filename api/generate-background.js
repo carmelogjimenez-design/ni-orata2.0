@@ -1,13 +1,19 @@
 export const config = { runtime: 'edge' };
 
 const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
-const FLUX_SCHNELL = 'black-forest-labs/flux-schnell';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+  });
+}
 
 const STYLE_TEMPLATES = {
   callejero: {
@@ -47,7 +53,6 @@ async function generateOne(prompt, aspectRatio) {
     headers: {
       'Authorization': `Bearer ${REPLICATE_TOKEN}`,
       'Content-Type': 'application/json',
-      'Prefer': 'wait',
     },
     body: JSON.stringify({
       input: {
@@ -63,32 +68,39 @@ async function generateOne(prompt, aspectRatio) {
     }),
   });
 
-  const prediction = await res.json();
-  if (prediction.error) throw new Error(prediction.error);
+  let prediction = await res.json();
+  if (prediction.error) throw new Error(String(prediction.error));
+  if (!prediction.id || !prediction.urls || !prediction.urls.get) {
+    throw new Error('Respuesta inesperada: ' + JSON.stringify(prediction));
+  }
 
-  let finalPrediction = prediction;
+  const pollUrl = prediction.urls.get;
   let attempts = 0;
-  while (finalPrediction.status !== 'succeeded' && finalPrediction.status !== 'failed' && attempts < 30) {
+  while (
+    prediction.status !== 'succeeded' &&
+    prediction.status !== 'failed' &&
+    prediction.status !== 'canceled' &&
+    attempts < 60
+  ) {
     await new Promise((r) => setTimeout(r, 800));
-    const pollRes = await fetch(finalPrediction.urls.get, {
+    const pollRes = await fetch(pollUrl, {
       headers: { 'Authorization': `Bearer ${REPLICATE_TOKEN}` },
     });
-    finalPrediction = await pollRes.json();
+    prediction = await pollRes.json();
     attempts++;
   }
 
-  if (finalPrediction.status === 'failed') throw new Error(finalPrediction.error || 'failed');
-  return Array.isArray(finalPrediction.output) ? finalPrediction.output[0] : finalPrediction.output;
+  if (prediction.status !== 'succeeded') {
+    throw new Error(prediction.error || prediction.status || 'failed');
+  }
+
+  return Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
 }
 
 export default async function handler(req) {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
-  if (req.method !== 'POST') {
-    return new Response(JSON.stringify({ error: 'Solo POST' }), { status: 405, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
-  }
-  if (!REPLICATE_TOKEN) {
-    return new Response(JSON.stringify({ error: 'REPLICATE_API_TOKEN no configurado' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
-  }
+  if (req.method !== 'POST') return json({ error: 'Solo POST' }, 405);
+  if (!REPLICATE_TOKEN) return json({ error: 'REPLICATE_API_TOKEN no configurado' }, 500);
 
   try {
     const body = await req.json();
@@ -97,9 +109,7 @@ export default async function handler(req) {
     const aspectRatio = body.aspectRatio ?? '4:5';
     const count = Math.min(Math.max(body.count ?? 4, 1), 4);
 
-    if (!userInput.trim()) {
-      return new Response(JSON.stringify({ error: 'userInput vacío' }), { status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
-    }
+    if (!userInput.trim()) return json({ error: 'userInput vacío' }, 400);
 
     const prompt = buildPrompt(userInput, style);
     const promises = Array.from({ length: count }, () => generateOne(prompt, aspectRatio));
@@ -115,14 +125,12 @@ export default async function handler(req) {
       }));
 
     if (options.length === 0) {
-      return new Response(JSON.stringify({ error: 'Todas las generaciones fallaron' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+      const firstError = results.find((r) => r.status === 'rejected');
+      return json({ error: 'Todas fallaron: ' + (firstError?.reason?.message || 'desconocido') }, 500);
     }
 
-    return new Response(JSON.stringify({ options }), {
-      status: 200,
-      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-    });
+    return json({ options });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+    return json({ error: err.message || String(err) }, 500);
   }
 }
