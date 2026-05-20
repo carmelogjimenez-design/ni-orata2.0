@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "api/remove-background.js": { "maxDuration": 60 },
+    "api/generate-background.js": { "maxDuration": 60 }
+  }
+}
