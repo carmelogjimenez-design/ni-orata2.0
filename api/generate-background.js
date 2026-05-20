@@ -1,8 +1,9 @@
 export const config = { runtime: 'edge' };
 
-const REPLICATE_TOKEN = process.env.REPLICATE_API_TOKEN;
+const HF_TOKEN = process.env.HUGGINGFACE_API_TOKEN;
+const MODEL = 'black-forest-labs/FLUX.1-schnell';
 
-const CORS_HEADERS = {
+const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
@@ -11,34 +12,41 @@ const CORS_HEADERS = {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+    headers: { ...CORS, 'Content-Type': 'application/json' },
   });
+}
+
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
 }
 
 const STYLE_TEMPLATES = {
   callejero: {
     prefix: 'gritty street football scene,',
-    suffix: ', urban graffiti walls, golden hour light, shallow depth of field, 35mm film grain, cinematic composition, empty scene, no people',
+    suffix: ', urban graffiti walls, golden hour light, cinematic, empty scene, no people',
   },
   cyberpunk: {
     prefix: 'neon-lit cyberpunk',
-    suffix: ', rain-soaked streets, holographic billboards, purple and acid green lights, blade runner aesthetic, dense atmosphere, empty scene, no people',
+    suffix: ', rain-soaked streets, holographic billboards, purple and green lights, empty scene, no people',
   },
   poster: {
     prefix: 'dramatic cinematic poster background of',
-    suffix: ', dark moody lighting, vignette, high contrast, cinematic color grading, depth, painterly textures, empty scene',
+    suffix: ', dark moody lighting, high contrast, cinematic color grading, empty scene',
   },
   cromo: {
     prefix: 'vintage 90s trading card background,',
-    suffix: ', metallic foil effect, holographic shine, geometric shapes, retro sports aesthetic, panini-style, empty card',
+    suffix: ', metallic foil effect, holographic shine, geometric shapes, panini-style',
   },
   meme: {
     prefix: 'raw unfiltered photo of',
-    suffix: ', amateur phone camera quality, harsh flash, awkward composition, internet meme aesthetic',
+    suffix: ', amateur phone camera, harsh flash, internet meme aesthetic',
   },
   realista: {
     prefix: 'photorealistic',
-    suffix: ', natural lighting, sharp focus, detailed textures, professional photography, empty scene, no people',
+    suffix: ', natural lighting, sharp focus, professional photography, empty scene, no people',
   },
 };
 
@@ -47,72 +55,61 @@ function buildPrompt(userInput, style) {
   return `${t.prefix} ${userInput.trim()}${t.suffix}`;
 }
 
-async function generateOne(prompt, aspectRatio) {
-  const res = await fetch('https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${REPLICATE_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      input: {
-        prompt,
-        aspect_ratio: aspectRatio,
-        num_outputs: 1,
-        num_inference_steps: 4,
-        output_format: 'webp',
-        output_quality: 85,
-        go_fast: true,
-        megapixels: '1',
+async function generateOne(prompt, seed) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`https://api-inference.huggingface.co/models/${MODEL}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${HF_TOKEN}`,
+        'Content-Type': 'application/json',
+        'x-use-cache': 'false',
       },
-    }),
-  });
-
-  let prediction = await res.json();
-  if (prediction.error) throw new Error(String(prediction.error));
-  if (!prediction.id || !prediction.urls || !prediction.urls.get) {
-    throw new Error('Respuesta inesperada: ' + JSON.stringify(prediction));
-  }
-
-  const pollUrl = prediction.urls.get;
-  let attempts = 0;
-  while (
-    prediction.status !== 'succeeded' &&
-    prediction.status !== 'failed' &&
-    prediction.status !== 'canceled' &&
-    attempts < 60
-  ) {
-    await new Promise((r) => setTimeout(r, 800));
-    const pollRes = await fetch(pollUrl, {
-      headers: { 'Authorization': `Bearer ${REPLICATE_TOKEN}` },
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: {
+          width: 768,
+          height: 960,
+          num_inference_steps: 4,
+          seed,
+        },
+      }),
     });
-    prediction = await pollRes.json();
-    attempts++;
-  }
 
-  if (prediction.status !== 'succeeded') {
-    throw new Error(prediction.error || prediction.status || 'failed');
-  }
+    if (res.ok) {
+      const buffer = await res.arrayBuffer();
+      const b64 = bufferToBase64(buffer);
+      return `data:image/png;base64,${b64}`;
+    }
 
-  return Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    if (res.status === 503) {
+      await new Promise((r) => setTimeout(r, 8000));
+      continue;
+    }
+
+    const errText = await res.text();
+    throw new Error(`HF ${res.status}: ${errText.slice(0, 150)}`);
+  }
+  throw new Error('Modelo cargando, reintenta en 30s');
 }
 
 export default async function handler(req) {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   if (req.method !== 'POST') return json({ error: 'Solo POST' }, 405);
-  if (!REPLICATE_TOKEN) return json({ error: 'REPLICATE_API_TOKEN no configurado' }, 500);
+  if (!HF_TOKEN) return json({ error: 'HUGGINGFACE_API_TOKEN no configurado en Vercel' }, 500);
 
   try {
     const body = await req.json();
     const userInput = body.userInput ?? '';
     const style = body.style ?? 'realista';
-    const aspectRatio = body.aspectRatio ?? '4:5';
     const count = Math.min(Math.max(body.count ?? 4, 1), 4);
 
     if (!userInput.trim()) return json({ error: 'userInput vacío' }, 400);
 
     const prompt = buildPrompt(userInput, style);
-    const promises = Array.from({ length: count }, () => generateOne(prompt, aspectRatio));
+
+    const promises = Array.from({ length: count }, (_, i) =>
+      generateOne(prompt, Math.floor(Math.random() * 1000000) + i)
+    );
     const results = await Promise.allSettled(promises);
 
     const options = results
